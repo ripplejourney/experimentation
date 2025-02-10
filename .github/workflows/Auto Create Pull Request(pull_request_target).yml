@@ -1,0 +1,158 @@
+name: Auto Create Pull Request
+on:
+  # push:
+  #   branches-ignore:
+  #     - master
+  #     - main
+  pull_request_target:
+    types:
+      # - assigned
+      # - unassigned
+      # - labeled
+      # - unlabeled
+      - opened
+      - edited
+      # - closed
+      - reopened
+      - synchronize
+      # - converted_to_draft
+      # - ready_for_review
+      # - locked
+      # - unlocked
+      # - review_requested
+      # - review_request_removed
+      - auto_merge_enabled
+      - auto_merge_disabled
+  #   - 'feature/*' # 监听以'feature/'开头的分支
+  #   - 'fix/*'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      manual_branch:
+        description: Set branch
+        required: true
+        type: string
+
+permissions: write-all
+env:
+  TARGET_BRANCH: ${{ vars.TARGET_BRANCH || github.event.repository.default_branch }} # 主分支名称
+  PREVIEW_REPO: ${{ vars.PREVIEW_REPO || 'ripplejourney/preview' }}
+  PREVIEW_BASE_URL: ${{ vars.PREVIEW_BASE_URL || 'https://www.dmsrs.org/experimentation' }}
+  PRODUCT_BASE_URL: ${{ vars.PRODUCT_BASE_URL || 'https://www.dmsrs.org' }}
+  REVIEWERS: ${{ vars.REVIEWERS || 'calmripple' }}
+  IS_DEBUG: ${{ vars.IS_DEBUG || 'false' }}
+
+concurrency:
+  # 针对远程部署库，无法同时部署多个preview 添加并行限制
+  # group: preview-${{ github.event_name }}-${{ github.event.number || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+  # group: preview
+  # cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      is_not_target_branch: ${{ steps.check.outputs.is_not_target_branch }}
+    steps:
+      - name: Check and Create Preview Environment
+        run: |
+          if ! gh environment list | grep -q "preview"; then
+            gh environment create preview
+          fi
+          
+          if ! gh environment list | grep -q "github-pages"; then
+            gh environment create github-pages
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: show debug info
+        if: ${{ env.IS_DEBUG == 'true' }}
+        uses: hmarr/debug-action@v3
+
+      - name: show github context
+        if: ${{ env.IS_DEBUG == 'true' }}
+        run: |
+          echo 'github.env.TARGET_BRANCH = ${{ github.env.TARGET_BRANCH }}'
+          echo 'env.TARGET_BRANCH = ${{ env.TARGET_BRANCH }}'
+          echo '${{ !contains(github.ref, env.TARGET_BRANCH)}} =${{github.ref}} ? ${{env.TARGET_BRANCH}}'
+          echo '${{ !contains(github.ref, env.TARGET_BRANCH)}} =${{github.ref}} ? ${{env.TARGET_BRANCH}}'
+
+          echo "GitHub Context:"
+          echo '${{ toJson(github) }}'
+
+        shell: bash
+
+      - name: printenv
+        if: ${{ env.IS_DEBUG == 'true' }}
+        run: printenv
+
+      - name: Check if it is the main branch
+        id: check
+        run: |
+          echo "is_not_target_branch=${{ !contains(github.ref, env.TARGET_BRANCH) }}" >> $GITHUB_OUTPUT
+
+        shell: bash
+  create-pr:
+    runs-on: ubuntu-latest
+    needs: check
+    if: ${{ needs.check.outputs.is_not_target_branch}}
+    outputs:
+      pull-request-number: ${{ steps.create_pr.outputs.pull-request-number }}
+      pull-request-operation: ${{ steps.create_pr.outputs.pull-request-operation }}
+      pull-request-url: ${{ steps.create_pr.outputs.pull-request-url }}
+    steps:
+      - name: Checkout repository
+        id: checkout
+        if: ${{ needs.check.outputs.is_not_target_branch}}
+        uses: actions/checkout@v4
+
+      - name: Git Configuration
+        # 2、配置 Git
+        run: |
+          git config --global core.quotePath false
+          git config --global core.autocrlf false
+          git config --global core.safecrlf true
+          git config --global core.ignorecase false
+
+      - name: Create Pull Request
+        id: create_pr
+        if: ${{ steps.checkout.outcome == 'success'}}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: auto-create-pr'
+          title: '[auto PR]${{ github.ref_name }}'
+          body: |
+            This is an automated pull request created from a feature branch.
+            Please review and merge if ready.
+          branch: ${{ github.ref }}
+          base: ${{env.TARGET_BRANCH}} # 目标分支，根据你的仓库情况可能是'main'或'master'
+          delete-branch: false
+          # # A comma or newline-separated list of reviewers (GitHub usernames) to request a review from.
+          reviewers: ${{env.reviewers}}
+          # # A comma or newline-separated list of GitHub teams to request a review from. Note that a repo scoped PAT, or equivalent GitHub App permissions, are required.
+          # team-reviewers: ${{env.team-reviewers}}
+
+
+  merge:
+    needs: [create-pr,  check]
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.merge.outputs.commit }}
+    steps:
+
+      - name: merge
+        if: ${{ contains(env.REVIEWERS, github.event.sender.login)}}
+        id: merge
+        uses: nbrugger-tgm/merge-pr-action@v0.2.3
+        with:
+          pull_request: ${{needs.create-pr.outputs.pull-request-number }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          method: merge
+          title: 'chore: auto-merge pr -${{needs.create-pr.outputs.pull-request-number }}'
+          message: 'auto-merge: ${{needs.create-pr.outputs.pull-request-url}}'
+      - name: output
+        run: |
+          echo 'commit = ${{ steps.merge.outputs.commit   }}'
